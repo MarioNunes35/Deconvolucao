@@ -5,3 +5,5 @@ scipy
 plotly  
 matplotlib
 PyPDF2      
+flask
+gunicorn
