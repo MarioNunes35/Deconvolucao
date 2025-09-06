@@ -11,17 +11,11 @@ import webbrowser
 import threading
 import time
 import json
-try:
-    from flask import Flask, render_template_string, send_from_directory, jsonify
-    from werkzeug.serving import make_server
-except Exception:
-    Flask = None
-    render_template_string = None
-    send_from_directory = None
-    jsonify = None
-    make_server = None
+from flask import Flask, render_template_string, send_from_directory, jsonify
+from werkzeug.serving import make_server
+import subprocess
 
-IS_STREAMLIT = False
+# --- Streamlit detection (for embedding HTML UI) ---
 try:
     import streamlit as st
     from streamlit.components.v1 import html as st_html
@@ -29,19 +23,15 @@ try:
 except Exception:
     st = None
     st_html = None
+    IS_STREAMLIT = False
 
-import subprocess
 
 class RamanApp:
     def __init__(self):
-        # Inicializa somente se Flask estiver disponível
+        self.app = Flask(__name__)
         self.server = None
-        self.port = int(os.getenv('FLASK_PORT', '0'))  # 0 = porta dinâmica
-        if Flask is not None:
-            self.app = Flask(__name__)
-            self.setup_routes()
-        else:
-            self.app = None
+        self.port = 8080
+        self.setup_routes()
         
     def setup_routes(self):
         @self.app.route('/')
@@ -1534,42 +1524,45 @@ class RamanApp:
         '''
 
     def start_server(self):
-        """Inicia o servidor Flask (apenas quando habilitado)."""
-        if make_server is None or Flask is None:
-            raise RuntimeError("Flask/Werkzeug não disponíveis. Defina ENABLE_FLASK=1 e instale as dependências para usar o servidor.")
+        """Inicia o servidor Flask"""
         try:
-            # Porta dinâmica se self.port == 0
-            self.server = make_server('127.0.0.1', (self.port or 0), self.app, threaded=True)
-            # Atualiza a porta real alocada (quando 0)
-            try:
-                self.port = self.server.server_port
-            except Exception:
-                pass
-
-            print(f"🔬 Servidor Raman iniciado em http://127.0.0.1:{self.port}")
-            if os.getenv("OPEN_BROWSER", "1") == "1":
-                print("🌐 Abrindo navegador...")
-                threading.Timer(1.5, lambda: webbrowser.open(f'http://127.0.0.1:{self.port}')).start()
-
-            # Iniciar servidor (bloqueante)
+            self.server = make_server('localhost', self.port, self.app, threaded=True)
+            print(f"🔬 Servidor Raman iniciado em http://localhost:{self.port}")
+            print("🌐 Abrindo navegador...")
+            
+            # Abrir navegador após pequeno delay
+            threading.Timer(2.0, lambda: webbrowser.open(f'http://localhost:{self.port}')).start()
+            
+            # Iniciar servidor
             self.server.serve_forever()
-
+            
         except OSError as e:
-            print(f"⚠ Erro ao iniciar servidor: {e}")
-            raise
+            if "Address already in use" in str(e):
+                print(f"⚠ Porta {self.port} já está em uso. Tentando porta alternativa...")
+                self.port += 1
+                if self.port < 8090:  # Tentar até 8090
+                    self.start_server()
+                else:
+                    print("⚠ Não foi possível encontrar uma porta disponível.")
+            else:
+                print(f"⚠ Erro ao iniciar servidor: {e}")
+    
+    def stop_server(self):
+        """Para o servidor"""
+        if self.server:
+            self.server.shutdown()
+            print("🛑 Servidor parado.")
+
 
 def run_streamlit(self):
         """Roda a interface no Streamlit embutindo o HTML da aplicação."""
         if not IS_STREAMLIT or st_html is None:
             raise RuntimeError("Streamlit não disponível. Instale 'streamlit' ou execute com ENABLE_FLASK=1.")
-        # Configuração básica da página
         try:
             st.set_page_config(page_title="Deconvolução Espectral Raman", layout="wide")
         except Exception:
-            # set_page_config pode falhar se chamada múltiplas vezes em rerun
-            pass
+            pass  # pode ser chamado múltiplas vezes nos reruns
         st_html(self.get_html_template(), height=1200, scrolling=True)
-
 
 def check_requirements():
     """Verifica se as dependências estão instaladas"""
@@ -1601,30 +1594,38 @@ def check_data_file():
     return True
 
 def main():
-    # Se ENABLE_FLASK=1, roda Flask; caso contrário, tenta Streamlit
-    enable_flask = os.getenv("ENABLE_FLASK", "0") == "1"
+    """Função principal"""
+    print("=" * 60)
+    print("🔬 DECONVOLUÇÃO ESPECTRAL RAMAN")
+    print("   Versão com Controles Ajustados para Altas Intensidades")
+    print("=" * 60)
+    
+    # Verificar dependências
+    if not check_requirements():
+        return
+    
+    # Verificar arquivo de dados
+    check_data_file()
+    
+    print("✅ Iniciando aplicação...")
+    print("📈 NOVO: Controles ajustados automaticamente baseados nos dados")
+    print("   - Amplitude: até 50.000+ (ajustado dinamicamente)")
+    print("   - Baseline: até 15.000+ (ajustado dinamicamente)")
+    print("   - Inputs numéricos para valores precisos")
+    
+    # Criar e iniciar aplicação
     app = RamanApp()
-
-    if enable_flask:
-        # Checagem leve de dependência só quando Flask estiver habilitado
-        if Flask is None or make_server is None:
-            print("❌ Flask/Werkzeug não instalados. Instale com: pip install Flask werkzeug")
-            sys.exit(1)
-        try:
-            app.start_server()
-        except KeyboardInterrupt:
-            print("\n\n⏹️  Interrompido pelo usuário.")
-            app.stop_server()
-        except Exception as e:
-            print(f"\n⚠ Erro inesperado: {e}")
-            app.stop_server()
-    else:
-        if IS_STREAMLIT:
-            # Rodar dentro do Streamlit: `streamlit run python_launcher_fixed.py`
-            app.run_streamlit()
-        else:
-            print("ℹ Para usar a interface, execute com Streamlit:\n"      "   streamlit run python_launcher_fixed.py\n"      "   ou defina ENABLE_FLASK=1 para rodar o servidor Flask local.")
+    
+    try:
+        app.start_server()
+    except KeyboardInterrupt:
+        print("\n\n⏹️  Interrompido pelo usuário.")
+        app.stop_server()
+    except Exception as e:
+        print(f"\n⚠ Erro inesperado: {e}")
+        app.stop_server()
 
 if __name__ == "__main__":
     main()
+
 
