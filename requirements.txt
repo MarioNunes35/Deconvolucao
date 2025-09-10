@@ -1,11 +1,6 @@
 streamlit
 numpy
 pandas
-scipy
 plotly
-matplotlib
-PyPDF2
-flask
-gunicorn
 openpyxl
 xlrd
