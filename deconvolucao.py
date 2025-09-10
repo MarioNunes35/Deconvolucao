@@ -1,312 +1,373 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Deconvolução Raman (1500–1700 cm⁻¹) — Streamlit
-• Bandas ajustáveis (Centro, Amplitude, Largura/FWHM, Forma Gaussiana↔Lorentziana)
-• Leitura de CSV/Excel (detecta separador), ordenação e filtro por faixa espectral
-• Gráficos interativos com Plotly (Espectro, Ajuste, Bandas, Resíduos)
-• Exportação JSON (parâmetros + estatísticas + espectro/ajuste/resíduos)
-Notas de robustez em relação ao original:
-- Removido @st.cache_data em funções puras (numpy arrays podem causar hashing em algumas versões)
-- Fallback para add_hline ausente (algumas versões antigas do plotly) usando shapes
-- Leitura de CSV com detecção automática de separador (sep=None, engine='python')
-- Mensagens de erro mais claras e validações adicionais
-- Chaves únicas e estáveis para sliders (c_i, a_i, w_i, s_i)
-- Exemplo integrado (botão) para testes rápidos
-"""
 
+import io
 import json
-from datetime import datetime
-
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
+from scipy.signal import savgol_filter, find_peaks
+from scipy.optimize import least_squares
+import plotly.graph_objects as go
 
-# ---------- Config da página (precisa vir antes de outros st.*) ----------
-try:
-    st.set_page_config(page_title="Deconvolução Raman", page_icon="🔬", layout="wide")
-except Exception:
-    # Em alguns ambientes (re-run / multipages) set_page_config pode já ter sido chamado
-    pass
+st.set_page_config(page_title="Deconvolução Raman (Gaussian/Lorentzian)", layout="wide")
 
-
-# ---------- Funções matemáticas ----------
-def gaussian(x, center, amplitude, width):
-    """Gaussiana (FWHM -> sigma)."""
-    sigma = width / (2.0 * np.sqrt(2.0 * np.log(2.0)))
-    return amplitude * np.exp(-0.5 * ((x - center) / sigma) ** 2)
-
-
-def lorentzian(x, center, amplitude, width):
-    """Lorentziana (FWHM -> gamma)."""
-    gamma = width / 2.0
-    return amplitude * (gamma**2) / ((x - center) ** 2 + gamma**2)
-
-
-def mixed_function(x, center, amplitude, width, shape_factor):
+# ------------------------ Helpers ------------------------
+def als_baseline(y, lam=1e5, p=0.01, niter=10):
     """
-    Mistura Gaussiana-Lorentziana (shape_factor 0.0=Gauss, 1.0=Lorenz).
+    Asymmetric Least Squares baseline (Eilers & Boelens, 2005)
+    lam: suavização; p: assimetria (0<p<1); niter: iterações.
     """
-    if shape_factor <= 0.0:
-        return gaussian(x, center, amplitude, width)
-    if shape_factor >= 1.0:
-        return lorentzian(x, center, amplitude, width)
-    g = gaussian(x, center, amplitude, width)
-    l = lorentzian(x, center, amplitude, width)
-    return (1.0 - shape_factor) * g + shape_factor * l
+    import scipy.sparse as sp
+    from scipy.sparse.linalg import spsolve
+    L = len(y)
+    D = sp.diags([1, -2, 1], [0, -1, -2], shape=(L, L-2))
+    w = np.ones(L)
+    for _ in range(niter):
+        W = sp.diags(w, 0, shape=(L, L))
+        Z = W + lam * D @ D.T
+        z = spsolve(Z, w*y)
+        w = p * (y > z) + (1-p) * (y < z)
+    return np.asarray(z)
 
+def gaussian(x, A, x0, sigma):
+    return A * np.exp(-(x - x0)**2 / (2 * sigma**2))
 
-def calculate_area(amplitude, width, shape_factor):
-    """
-    Área aproximada sob a banda (analítica para G e L, combinação linear para mistura).
-    """
-    # Área Gaussiana usando FWHM
-    gauss_area = amplitude * width * np.sqrt(2.0 * np.pi) / (2.0 * np.sqrt(2.0 * np.log(2.0)))
-    # Área Lorentziana usando FWHM
-    lorenz_area = amplitude * width * np.pi / 2.0
-    if shape_factor <= 0.0:
-        return gauss_area
-    if shape_factor >= 1.0:
-        return lorenz_area
-    return (1.0 - shape_factor) * gauss_area + shape_factor * lorenz_area
+def lorentzian(x, A, x0, gamma):
+    return A * (gamma**2) / ((x - x0)**2 + gamma**2)
 
+def pseudo_voigt(x, A, x0, sigma, gamma, eta):
+    # eta in [0,1], mix of gaussian (1-eta) and lorentzian eta
+    return (1-eta) * gaussian(x, A, x0, sigma) + eta * lorentzian(x, A, x0, gamma)
 
-# ---------- Dados de exemplo ----------
-def load_example_data():
-    wavenumbers = np.arange(1500, 1701, 1.0)
-    baseline = 2000.0
-    intensity = np.full_like(wavenumbers, baseline, dtype=float)
+def fwhm_gaussian(sigma):
+    return 2.354820045 * sigma
 
-    # (center, amplitude, width(FWHM), shape_factor [0=G .. 1=L])
-    example_bands = [
-        (1547.0, 8000.0, 15.0, 0.3),
-        (1566.0, 6000.0, 12.0, 0.1),
-        (1580.0, 12000.0, 18.0, 0.0),
-        (1604.0, 10000.0, 16.0, 0.2),
-        (1620.0, 15000.0, 20.0, 0.4),
-        (1632.0, 7000.0, 13.0, 0.0),
-        (1667.0, 5000.0, 22.0, 0.6),
-    ]
+def sigma_from_fwhm(fwhm):
+    return fwhm / 2.354820045
 
-    for c, a, w, s in example_bands:
-        intensity += mixed_function(wavenumbers, c, a, w, s)
+def gamma_from_fwhm(fwhm):
+    return fwhm / 2.0
 
-    df = pd.DataFrame({"wavenumber": wavenumbers, "intensity": intensity})
-    return df
+def area_gaussian(A, sigma):
+    return A * sigma * np.sqrt(2*np.pi)
 
+def area_lorentzian(A, gamma):
+    return A * np.pi * gamma
 
-# ---------- Leitura e preparo de arquivo ----------
-def process_file(uploaded_file):
-    try:
-        name = uploaded_file.name.lower()
-        if name.endswith(".csv"):
-            # autodetecta separador e decimal
-            df = pd.read_csv(uploaded_file, sep=None, engine="python")
-        else:
-            df = pd.read_excel(uploaded_file)
+def initial_guess_from_centers(x, y, centers, profile, fwhm_guess, invert_peaks):
+    y2 = -y if invert_peaks else y
+    A_guess = []
+    w_guess = []
+    for c in centers:
+        idx = (np.abs(x - c)).argmin()
+        A_guess.append(max(y2[idx] - np.median(y2), 1e-6))
+        w_guess.append(fwhm_guess)
+    A_guess = np.array(A_guess)
+    w_guess = np.array(w_guess)
 
-        # Normaliza nomes de colunas e pega as 2 primeiras como wavenumber/intensity
-        cols = list(df.columns)
-        if len(cols) < 2:
-            raise ValueError("Arquivo precisa conter ao menos 2 colunas (wavenumber, intensity).")
+    params = []
+    for A, c, w in zip(A_guess, centers, w_guess):
+        if profile == "Gaussian":
+            sigma = sigma_from_fwhm(w)
+            params.extend([A, c, sigma])
+        elif profile == "Lorentzian":
+            gamma = gamma_from_fwhm(w)
+            params.extend([A, c, gamma])
+        elif profile == "Pseudo-Voigt":
+            sigma = sigma_from_fwhm(w)
+            gamma = gamma_from_fwhm(w)
+            params.extend([A, c, sigma, gamma, 0.5])
+    return np.array(params, dtype=float)
 
-        df = df.rename(columns={cols[0]: "wavenumber", cols[1]: "intensity"})
-        # Converte para numérico e trata não-numéricos
-        df["wavenumber"] = pd.to_numeric(df["wavenumber"], errors="coerce")
-        df["intensity"] = pd.to_numeric(df["intensity"], errors="coerce")
-        df = df.dropna(subset=["wavenumber", "intensity"])
+def model_sum(x, params, profile):
+    y = np.zeros_like(x, dtype=float)
+    i = 0
+    if profile == "Gaussian":
+        while i + 2 < len(params):
+            A, x0, sigma = params[i:i+3]
+            y += gaussian(x, A, x0, sigma)
+            i += 3
+    elif profile == "Lorentzian":
+        while i + 2 < len(params):
+            A, x0, gamma = params[i:i+3]
+            y += lorentzian(x, A, x0, gamma)
+            i += 3
+    elif profile == "Pseudo-Voigt":
+        while i + 4 < len(params):
+            A, x0, sigma, gamma, eta = params[i:i+5]
+            eta = np.clip(eta, 0.0, 1.0)
+            y += pseudo_voigt(x, A, x0, sigma, gamma, eta)
+            i += 5
+    return y
 
-        # Filtra faixa 1500–1700 cm⁻¹
-        df = df[(df["wavenumber"] >= 1500.0) & (df["wavenumber"] <= 1700.0)]
-        df = df.sort_values("wavenumber").reset_index(drop=True)
-        if df.empty:
-            raise ValueError("Após o filtro 1500–1700 cm⁻¹, não restaram pontos válidos.")
+def fit_peaks(x, y, centers, profile, fwhm_guess, allow_shift, max_shift, nonneg, invert_peaks):
+    y_fit_target = -y if invert_peaks else y
+    p0 = initial_guess_from_centers(x, y_fit_target, centers, profile, fwhm_guess, invert_peaks)
 
-        return df
-    except Exception as e:
-        st.error(f"Erro ao processar arquivo: {e}")
-        return None
+    # bounds
+    lb = []
+    ub = []
+    for c in centers:
+        if profile == "Gaussian":
+            lb += [0.0 if nonneg else -np.inf, c - max_shift if allow_shift else c, 1e-6]
+            ub += [np.inf, c + max_shift if allow_shift else c, np.inf]
+        elif profile == "Lorentzian":
+            lb += [0.0 if nonneg else -np.inf, c - max_shift if allow_shift else c, 1e-6]
+            ub += [np.inf, c + max_shift if allow_shift else c, np.inf]
+        elif profile == "Pseudo-Voigt":
+            lb += [0.0 if nonneg else -np.inf, c - max_shift if allow_shift else c, 1e-6, 1e-6, 0.0]
+            ub += [np.inf, c + max_shift if allow_shift else c, np.inf,  np.inf, 1.0]
 
+    def residuals(p):
+        return model_sum(x, p, profile) - y_fit_target
 
-# ---------- UI principal ----------
-def main():
-    st.title("🔬 Deconvolução Espectral Raman")
-    st.markdown("**Modelos: Gaussiana + Lorentziana (mistura)** · **Faixa: 1500–1700 cm⁻¹**")
+    res = least_squares(residuals, p0, bounds=(np.array(lb), np.array(ub)))
+    p_opt = res.x
+    return p_opt, res.cost, res.success
 
-    # Sidebar — dados e configurações gerais
-    with st.sidebar:
-        st.header("📁 Dados")
-        uploaded_file = st.file_uploader("Arquivo Excel/CSV", type=["xlsx", "xls", "csv"])
-        use_example = st.button("🧪 Carregar dados de exemplo")
-
-        st.divider()
-        st.header("⚙️ Configurações")
-        baseline = st.slider("Baseline (offset)", 0, 20000, 2000, 100)
-        show_bands = st.checkbox("Mostrar bandas individuais", True)
-        show_residuals = st.checkbox("Mostrar resíduos (exp - ajuste)", True)
-
-    # Carregamento dos dados
-    if uploaded_file is not None:
-        data = process_file(uploaded_file)
-        if data is None:
-            return
-        st.success(f"✅ {len(data)} pontos carregados")
-    elif use_example:
-        data = load_example_data()
-        st.success("✅ Dados de exemplo carregados")
-    else:
-        st.info("👆 Carregue um arquivo ou use os dados de exemplo para continuar.")
-        return
-
-    # Estado inicial de bandas
-    if "bands" not in st.session_state:
-        st.session_state.bands = [
-            {"name": "Banda 1", "center": 1547.0, "amplitude": 5000, "width": 15.0, "shape": 0.0, "color": "#ff6b6b"},
-            {"name": "Banda 2", "center": 1566.0, "amplitude": 4000, "width": 12.0, "shape": 0.0, "color": "#4ecdc4"},
-            {"name": "Banda 3", "center": 1580.0, "amplitude": 8000, "width": 18.0, "shape": 0.0, "color": "#45b7d1"},
-            {"name": "Banda 4", "center": 1604.0, "amplitude": 6000, "width": 16.0, "shape": 0.0, "color": "#96ceb4"},
-            {"name": "Banda 5", "center": 1620.0, "amplitude": 5000, "width": 14.0, "shape": 0.0, "color": "#ffeaa7"},
-        ]
-
-    max_amp = max(50000, int(data["intensity"].max() * 1.5))
-
-    # Layout principal
-    col_controls, col_plot = st.columns([1, 2])
-
-    with col_controls:
-        st.header("🎛️ Controles")
-        for i, band in enumerate(st.session_state.bands):
-            with st.expander(f"{band['name']}", expanded=i < 3):
-                center = st.slider("Centro (cm⁻¹)", 1500.0, 1700.0, float(band["center"]), 0.5, key=f"c_{i}")
-                amplitude = st.slider("Amplitude", 0, max_amp, int(band["amplitude"]), 100, key=f"a_{i}")
-                width = st.slider("FWHM (cm⁻¹)", 3.0, 80.0, float(band["width"]), 0.5, key=f"w_{i}")
-                shape = st.slider("Forma (0=Gauss, 1=Lorenz)", 0.0, 1.0, float(band["shape"]), 0.05, key=f"s_{i}")
-
-                st.session_state.bands[i].update(
-                    {"center": center, "amplitude": amplitude, "width": width, "shape": shape}
-                )
-
-                if shape == 0.0:
-                    st.caption("Modelo: **Gaussiana**")
-                elif shape == 1.0:
-                    st.caption("Modelo: **Lorentziana**")
-                else:
-                    st.caption(f"Modelo: **Misto** (G:{1.0-shape:.2f} · L:{shape:.2f})")
-
-    with col_plot:
-        st.header("📊 Gráfico")
-
-        # Vetores
-        x = data["wavenumber"].to_numpy(dtype=float)
-        exp = data["intensity"].to_numpy(dtype=float)
-
-        # Ajuste total
-        fitted = np.full_like(x, float(baseline), dtype=float)
-        contributions = []
-        for band in st.session_state.bands:
-            contrib = mixed_function(x, band["center"], band["amplitude"], band["width"], band["shape"])
-            fitted += contrib
-            contributions.append(contrib)
-
-        # Estatísticas básicas
-        residuals = exp - fitted
-        ss_res = float(np.sum(residuals**2))
-        ss_tot = float(np.sum((exp - np.mean(exp))**2))
-        r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
-        rmse = float(np.sqrt(np.mean(residuals**2)))
-        mae = float(np.mean(np.abs(residuals)))
-
-        # Gráfico principal
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=x, y=exp, mode="lines", name="Experimental", line=dict(color="black", width=2)))
-        fig.add_trace(go.Scatter(x=x, y=fitted, mode="lines", name="Ajuste", line=dict(color="red", width=2, dash="dash")))
-        fig.add_trace(
-            go.Scatter(x=x, y=np.full_like(x, baseline), mode="lines", name="Baseline", line=dict(color="gray", width=1, dash="dot"))
-        )
-
-        if show_bands:
-            for band, contrib in zip(st.session_state.bands, contributions):
-                fig.add_trace(
-                    go.Scatter(x=x, y=baseline + contrib, mode="lines", name=band["name"], line=dict(color=band["color"], width=2), opacity=0.7)
-                )
-
-        fig.update_layout(title="Deconvolução", xaxis_title="Raman Shift (cm⁻¹)", yaxis_title="Intensidade", height=420)
-        st.plotly_chart(fig, use_container_width=True)
-
-        # Resíduos
-        if show_residuals:
-            fig_res = go.Figure()
-            fig_res.add_trace(go.Scatter(x=x, y=residuals, mode="lines+markers", name="Resíduos"))
-            # Fallback para add_hline ausente
-            try:
-                fig_res.add_hline(y=0, line_dash="dash", line_color="gray")
-            except Exception:
-                fig_res.update_layout(
-                    shapes=[dict(type="line", xref="paper", x0=0, x1=1, yref="y", y0=0, y1=0, line=dict(dash="dash", width=1))]
-                )
-
-            fig_res.update_layout(title="Resíduos (Experimental - Ajuste)", xaxis_title="Raman Shift (cm⁻¹)", yaxis_title="Intensidade", height=300)
-            st.plotly_chart(fig_res, use_container_width=True)
-
-    # Métricas
-    st.header("📈 Resultados")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("R²", f"{r2:.4f}")
-    c2.metric("RMSE", f"{rmse:.1f}")
-    c3.metric("MAE", f"{mae:.1f}")
-    c4.metric("Pontos", len(data))
-
-    # Tabela de parâmetros
-    st.subheader("📋 Parâmetros das Bandas")
+def params_to_table(params, profile):
     rows = []
-    for band in st.session_state.bands:
-        area = calculate_area(band["amplitude"], band["width"], band["shape"])
-        curve_type = "Gaussiana" if band["shape"] == 0.0 else ("Lorentziana" if band["shape"] == 1.0 else "Mista")
-        rows.append(
-            {
-                "Banda": band["name"],
-                "Centro (cm⁻¹)": f"{band['center']:.1f}",
-                "Amplitude": int(band["amplitude"]),
-                "FWHM (cm⁻¹)": f"{band['width']:.1f}",
-                "Tipo": curve_type,
-                "Área (aprox.)": f"{area:,.0f}",
-            }
-        )
-    st.dataframe(pd.DataFrame(rows), use_container_width=True)
+    i = 0
+    idx = 1
+    if profile == "Gaussian":
+        while i + 2 < len(params):
+            A, x0, sigma = params[i:i+3]
+            fwhm = fwhm_gaussian(sigma)
+            area = area_gaussian(A, sigma)
+            rows.append(dict(peak=idx, center=x0, amplitude=A, fwhm=fwhm, area=area))
+            idx += 1
+            i += 3
+    elif profile == "Lorentzian":
+        while i + 2 < len(params):
+            A, x0, gamma = params[i:i+3]
+            fwhm = 2*gamma
+            area = area_lorentzian(A, gamma)
+            rows.append(dict(peak=idx, center=x0, amplitude=A, fwhm=fwhm, area=area))
+            idx += 1
+            i += 3
+    elif profile == "Pseudo-Voigt":
+        while i + 4 < len(params):
+            A, x0, sigma, gamma, eta = params[i:i+5]
+            fwhm_g = fwhm_gaussian(sigma)
+            fwhm_l = 2*gamma
+            area = (1-eta)*area_gaussian(A, sigma) + eta*area_lorentzian(A, gamma)
+            rows.append(dict(peak=idx, center=x0, amplitude=A, fwhm_gaussian=fwhm_g, fwhm_lorentzian=fwhm_l, eta=eta, area_est=area))
+            idx += 1
+            i += 5
+    return pd.DataFrame(rows)
 
-    # Exportação JSON
-    st.subheader("💾 Exportar")
-    if st.button("📊 Baixar Resultados (JSON)"):
-        export_data = {
-            "timestamp": datetime.now().isoformat(),
-            "statistics": {"r2": r2, "rmse": rmse, "mae": mae},
-            "baseline": baseline,
-            "bands": [
-                {
-                    "name": b["name"],
-                    "center": float(b["center"]),
-                    "amplitude": int(b["amplitude"]),
-                    "width": float(b["width"]),
-                    "shape_factor": float(b["shape"]),
-                    "area": float(calculate_area(b["amplitude"], b["width"], b["shape"])),
-                }
-                for b in st.session_state.bands
-            ],
-            "spectrum": pd.DataFrame({"wavenumber": x, "experimental": exp, "fitted": fitted, "residual": residuals}).to_dict(
-                orient="records"
-            ),
-        }
-        json_str = json.dumps(export_data, indent=2, ensure_ascii=False)
-        st.download_button(
-            "📥 Download JSON",
-            json_str,
-            file_name=f"raman_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
-            mime="application/json",
-        )
+# ------------------------ UI ------------------------
+st.title("🔬 Deconvolução Espectral Raman — Streamlit")
 
+with st.sidebar:
+    st.header("Configurações & Entrada")
 
-if __name__ == "__main__":
-    main()
+    uploaded = st.file_uploader("Arquivo (.csv ou .xlsx) com duas colunas (x, y)", type=["csv", "xlsx"])
+    delimiter = st.text_input("Delimitador (CSV)", value=",")
+    sheet = st.text_input("Planilha (XLSX)", value="")
+
+    invert_peaks = st.checkbox("Picos para baixo (inverter y)", value=False)
+
+    do_smooth = st.checkbox("Suavizar (Savitzky-Golay)", value=True)
+    win = st.number_input("Janela (ímpar)", min_value=3, value=11, step=2)
+    poly = st.number_input("Ordem do polinômio", min_value=1, value=3, step=1)
+
+    do_baseline = st.checkbox("Subtrair linha base (ALS)", value=True)
+    lam = st.number_input("λ (ALS)", value=1e5, step=1e4, format="%.0f")
+    p_als = st.slider("p (ALS)", 0.0, 1.0, 0.01, step=0.01)
+    niter = st.number_input("Iterações (ALS)", min_value=1, value=10, step=1)
+
+    st.divider()
+    st.subheader("Picos & Ajuste")
+    profile = st.selectbox("Perfil dos picos", ["Gaussian", "Lorentzian", "Pseudo-Voigt"], index=1)
+    centers_text = st.text_input("Centros (cm⁻¹) separados por vírgula", value="")
+    auto_detect = st.checkbox("Detectar picos automaticamente (ignora centros acima)", value=False)
+    prominence = st.number_input("Proeminência mínima p/ detecção (relativa)", value=0.05, step=0.01)
+
+    fwhm_guess = st.number_input("FWHM inicial (cm⁻¹)", value=15.0, step=1.0)
+    allow_shift = st.checkbox("Permitir desvio dos centros", value=True)
+    max_shift = st.number_input("Desvio máx. (cm⁻¹)", value=8.0, step=0.5)
+    nonneg = st.checkbox("Amplitude não-negativa", value=True)
+
+    st.divider()
+    st.caption("Dica: Você pode clicar no ícone da câmera no gráfico para baixar PNG sem precisar do Kaleido.")
+
+df = None
+x = y = None
+
+if uploaded is not None:
+    try:
+        if uploaded.name.lower().endswith(".csv"):
+            df = pd.read_csv(uploaded, sep=delimiter)
+        else:
+            df = pd.read_excel(uploaded, sheet_name=sheet if sheet else 0)
+    except Exception as e:
+        st.error(f"Erro ao ler arquivo: {e}")
+
+if df is not None:
+    st.success(f"Arquivo carregado: {uploaded.name}")
+    cols = list(df.columns)
+    col_x = st.selectbox("Coluna X", cols, index=0 if len(cols)>0 else None)
+    col_y = st.selectbox("Coluna Y", cols, index=1 if len(cols)>1 else None)
+
+    x = np.asarray(pd.to_numeric(df[col_x], errors="coerce"), dtype=float)
+    y = np.asarray(pd.to_numeric(df[col_y], errors="coerce"), dtype=float)
+
+    mask = np.isfinite(x) & np.isfinite(y)
+    x = x[mask]
+    y = y[mask]
+
+    order = np.argsort(x)
+    x = x[order]
+    y = y[order]
+
+    y_proc = y.copy()
+    if do_smooth:
+        try:
+            if win % 2 == 0:
+                win += 1
+            # janela não pode exceder len(y_proc)-1 e deve ser ímpar
+            win_eff = min(win, max(5, (len(y_proc)//2)*2-1))
+            win_eff = win_eff if win_eff % 2 == 1 else win_eff-1
+            y_proc = savgol_filter(y_proc, window_length=max(5, win_eff), polyorder=min(poly, 5))
+        except Exception as e:
+            st.warning(f"Falha na suavização: {e}")
+
+    baseline = np.zeros_like(y_proc)
+    if do_baseline:
+        try:
+            baseline = als_baseline(y_proc, lam=lam, p=p_als, niter=int(niter))
+            y_proc = y_proc - baseline
+        except Exception as e:
+            st.warning(f"Falha na linha base: {e}")
+
+    centers = None
+    if auto_detect:
+        yp = -y_proc if invert_peaks else y_proc
+        if np.ptp(yp) > 0:
+            prom = prominence * np.ptp(yp)
+        else:
+            prom = prominence
+        peaks, _ = find_peaks(yp, prominence=max(prom, 1e-9))
+        centers = x[peaks]
+        centers = np.round(centers, 4)
+    else:
+        if centers_text.strip():
+            try:
+                centers = np.array([float(v) for v in centers_text.replace(";", ",").split(",") if v.strip()], dtype=float)
+            except Exception as e:
+                st.error(f"Não foi possível interpretar os centros: {e}")
+        else:
+            st.info("Informe os centros ou ative a detecção automática.")
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name="Original"))
+    if do_baseline:
+        fig.add_trace(go.Scatter(x=x, y=baseline, mode="lines", name="Linha base"))
+        fig.add_trace(go.Scatter(x=x, y=y - baseline, mode="lines", name="Sem linha base", line=dict(dash="dash")))
+    st.plotly_chart(fig, use_container_width=True)
+
+    if centers is not None and len(centers) > 0:
+        if st.button("Ajustar picos agora", type="primary"):
+            try:
+                params, cost, ok = fit_peaks(x, y_proc, centers, profile, fwhm_guess, allow_shift, max_shift, nonneg, invert_peaks)
+                y_fit = model_sum(x, params, profile)
+                fig2 = go.Figure()
+                fig2.add_trace(go.Scatter(x=x, y=y_proc, mode="lines", name="Processado"))
+                fig2.add_trace(go.Scatter(x=x, y=y_fit, mode="lines", name="Ajuste soma"))
+                i = 0
+                if profile == "Gaussian":
+                    while i + 2 < len(params):
+                        A, x0, sigma = params[i:i+3]
+                        yi = gaussian(x, A, x0, sigma)
+                        fig2.add_trace(go.Scatter(x=x, y=yi, mode="lines", name=f"Pico @ {x0:.2f}"))
+                        i += 3
+                elif profile == "Lorentzian":
+                    while i + 2 < len(params):
+                        A, x0, gamma = params[i:i+3]
+                        yi = lorentzian(x, A, x0, gamma)
+                        fig2.add_trace(go.Scatter(x=x, y=yi, mode="lines", name=f"Pico @ {x0:.2f}"))
+                        i += 3
+                elif profile == "Pseudo-Voigt":
+                    while i + 4 < len(params):
+                        A, x0, sigma, gamma, eta = params[i:i+5]
+                        yi = pseudo_voigt(x, A, x0, sigma, gamma, eta)
+                        fig2.add_trace(go.Scatter(x=x, y=yi, mode="lines", name=f"Pico @ {x0:.2f} (η={eta:.2f})"))
+                        i += 5
+                st.plotly_chart(fig2, use_container_width=True)
+
+                # tabela
+                def params_to_table(params, profile):
+                    rows = []
+                    i = 0
+                    idx = 1
+                    if profile == "Gaussian":
+                        while i + 2 < len(params):
+                            A, x0, sigma = params[i:i+3]
+                            fwhm = 2.354820045 * sigma
+                            area = A * sigma * np.sqrt(2*np.pi)
+                            rows.append(dict(peak=idx, center=x0, amplitude=A, fwhm=fwhm, area=area))
+                            idx += 1
+                            i += 3
+                    elif profile == "Lorentzian":
+                        while i + 2 < len(params):
+                            A, x0, gamma = params[i:i+3]
+                            fwhm = 2*gamma
+                            area = np.pi * gamma * A
+                            rows.append(dict(peak=idx, center=x0, amplitude=A, fwhm=fwhm, area=area))
+                            idx += 1
+                            i += 3
+                    elif profile == "Pseudo-Voigt":
+                        while i + 4 < len(params):
+                            A, x0, sigma, gamma, eta = params[i:i+5]
+                            fwhm_g = 2.354820045 * sigma
+                            fwhm_l = 2*gamma
+                            area = (1-eta)*(A*sigma*np.sqrt(2*np.pi)) + eta*(np.pi*gamma*A)
+                            rows.append(dict(peak=idx, center=x0, amplitude=A, fwhm_gaussian=fwhm_g, fwhm_lorentzian=fwhm_l, eta=eta, area_est=area))
+                            idx += 1
+                            i += 5
+                    return pd.DataFrame(rows)
+
+                table = params_to_table(params, profile)
+                st.subheader("Parâmetros ajustados")
+                st.dataframe(table, use_container_width=True)
+
+                st.download_button("Baixar parâmetros (CSV)",
+                                   data=table.to_csv(index=False).encode("utf-8"),
+                                   file_name="parametros_ajuste.csv",
+                                   mime="text/csv")
+
+                out = pd.DataFrame({"x": x, "y_processado": y_proc, "y_fit": y_fit})
+                st.download_button("Baixar curvas (CSV)",
+                                   data=out.to_csv(index=False).encode("utf-8"),
+                                   file_name="curvas_ajuste.csv",
+                                   mime="text/csv")
+
+                settings = dict(profile=profile,
+                                centers=list(map(float, centers)),
+                                fwhm_guess=float(fwhm_guess),
+                                allow_shift=bool(allow_shift),
+                                max_shift=float(max_shift),
+                                nonneg=bool(nonneg),
+                                invert_peaks=bool(invert_peaks),
+                                smooth=dict(enabled=bool(do_smooth), window=int(win), poly=int(poly)),
+                                baseline=dict(enabled=bool(do_baseline), lam=float(lam), p=float(p_als), niter=int(niter)))
+                st.download_button("Baixar configurações (JSON)",
+                                   data=json.dumps(settings, indent=2).encode("utf-8"),
+                                   file_name="config_ajuste.json",
+                                   mime="application/json")
+
+                st.success("Ajuste concluído." if ok else "Ajuste finalizado (resíduo não nulo).")
+            except Exception as e:
+                st.error(f"Falha no ajuste: {e}")
+    else:
+        st.info("Defina os centros ou ative a detecção automática para habilitar o ajuste.")
+
+else:
+    st.info("Faça upload de um arquivo para começar. Você também pode testar com o exemplo abaixo.")
+    try:
+        with open('exemplo_raman.csv', 'rb') as f:
+            st.download_button("Baixar exemplo_raman.csv", f, file_name="exemplo_raman.csv", mime="text/csv")
+    except Exception:
+        pass
 
 
